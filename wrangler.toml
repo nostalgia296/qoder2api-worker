@@ -1,0 +1,15 @@
+name = "qoder2api-worker"
+main = "src/index.ts"
+compatibility_date = "2026-08-01"
+
+[[durable_objects.bindings]]
+name = "BRIDGE"
+class_name = "QoderBridgeDO"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["QoderBridgeDO"]
+
+# 可选：覆盖 cosy 请求签名密钥
+# [vars]
+# QODER_SIGNATURE_SECRET = ""
