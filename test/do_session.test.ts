@@ -23,6 +23,20 @@ function sseDelta(content: string): string {
   })}\n\n`;
 }
 
+const USAGE = {
+  prompt_tokens: 11,
+  completion_tokens: 7,
+  total_tokens: 18,
+  completion_tokens_details: { reasoning_tokens: 3 },
+  prompt_tokens_details: { cached_tokens: 0 },
+};
+
+function sseUsage(usage: Record<string, any> = USAGE): string {
+  return `data:${JSON.stringify({
+    body: JSON.stringify({ choices: [], usage }),
+  })}\n\n`;
+}
+
 function authEnvelope(): string {
   return `data:${JSON.stringify({
     body: JSON.stringify({ code: "105", message: "Login expired" }),
@@ -46,7 +60,7 @@ function parseJobTokenBody(init: any): { needRefresh: boolean } {
 
 function makeFetch(
   c: Counters,
-  opts: { chatFirstResponse?: () => Response } = {},
+  opts: { chatFirstResponse?: () => Response; chatBody?: string } = {},
 ) {
   return async (input: any, init: any): Promise<Response> => {
     const url = String(input);
@@ -65,7 +79,7 @@ function makeFetch(
       if (opts.chatFirstResponse && c.chat === 1) {
         return opts.chatFirstResponse();
       }
-      return new Response(sseDelta("hi"), { status: 200 });
+      return new Response(opts.chatBody ?? sseDelta("hi"), { status: 200 });
     }
     return new Response("not found", { status: 404 });
   };
@@ -194,5 +208,104 @@ describe("QoderBridgeDO session", () => {
     const data = await resp.json();
     const ids = data.data.map((m: any) => m.id);
     expect(ids).toEqual(["Qwen3.7-Max"]);
+  });
+});
+
+function sseChunks(text: string): Record<string, any>[] {
+  return text
+    .split("\n")
+    .filter((l) => l.startsWith("data: ") && l !== "data: [DONE]")
+    .map((l) => JSON.parse(l.slice("data: ".length)));
+}
+
+const NEW_COUNTERS = (): Counters => ({
+  cold: 0,
+  refresh: 0,
+  chat: 0,
+  modelList: 0,
+});
+
+describe("upstream usage pass-through", () => {
+  it("non-stream relays upstream usage verbatim", async () => {
+    const dobj = makeDO(
+      makeFetch(NEW_COUNTERS(), { chatBody: sseDelta("hi") + sseUsage() }),
+    );
+    const resp = await dobj.fetch(chatRequest(CHAT_BODY));
+    const data = await resp.json();
+    expect(data.choices[0].message.content).toBe("hi");
+    expect(data.usage).toEqual(USAGE);
+  });
+
+  it("non-stream falls back to zeros when upstream reports no usage", async () => {
+    const dobj = makeDO(makeFetch(NEW_COUNTERS(), { chatBody: sseDelta("hi") }));
+    const data = await (await dobj.fetch(chatRequest(CHAT_BODY))).json();
+    expect(data.usage).toEqual({
+      prompt_tokens: 0,
+      completion_tokens: 0,
+      total_tokens: 0,
+    });
+  });
+
+  it("stream attaches usage to the finish_reason chunk", async () => {
+    const dobj = makeDO(
+      makeFetch(NEW_COUNTERS(), { chatBody: sseDelta("hi") + sseUsage() }),
+    );
+    const resp = await dobj.fetch(chatRequest({ ...CHAT_BODY, stream: true }));
+    const text = await resp.text();
+    const chunks = sseChunks(text);
+    const last = chunks[chunks.length - 1]!;
+    expect(last.choices[0].finish_reason).toBe("stop");
+    expect(last.usage).toEqual(USAGE);
+    expect(chunks.filter((ch) => ch.choices.length === 0)).toHaveLength(0);
+    expect(text.trimEnd().endsWith("data: [DONE]")).toBe(true);
+  });
+
+  it("stream emits a trailing empty-choices usage chunk for include_usage", async () => {
+    const dobj = makeDO(
+      makeFetch(NEW_COUNTERS(), { chatBody: sseDelta("hi") + sseUsage() }),
+    );
+    const resp = await dobj.fetch(
+      chatRequest({
+        ...CHAT_BODY,
+        stream: true,
+        stream_options: { include_usage: true },
+      }),
+    );
+    const chunks = sseChunks(await resp.text());
+    const last = chunks[chunks.length - 1]!;
+    const finish = chunks[chunks.length - 2]!;
+    expect(finish.choices[0].finish_reason).toBe("stop");
+    expect(finish.usage).toBeUndefined();
+    expect(last.choices).toEqual([]);
+    expect(last.usage).toEqual(USAGE);
+  });
+
+  it("stream omits usage entirely when upstream sends none", async () => {
+    const dobj = makeDO(makeFetch(NEW_COUNTERS(), { chatBody: sseDelta("hi") }));
+    const resp = await dobj.fetch(
+      chatRequest({
+        ...CHAT_BODY,
+        stream: true,
+        stream_options: { include_usage: true },
+      }),
+    );
+    const chunks = sseChunks(await resp.text());
+    expect(chunks.every((ch) => ch.usage === undefined)).toBe(true);
+    expect(chunks[chunks.length - 1]!.choices[0].finish_reason).toBe("stop");
+  });
+
+  it("captures usage from a bare final frame (no {body:...} envelope)", async () => {
+    const bare = `data:${JSON.stringify({
+      object: "chat.completion.chunk",
+      choices: [],
+      usage: USAGE,
+      raw_usage: { noise: true },
+      sub_usages: [{ noise: true }],
+    })}\n\n`;
+    const dobj = makeDO(
+      makeFetch(NEW_COUNTERS(), { chatBody: sseDelta("hi") + bare }),
+    );
+    const data = await (await dobj.fetch(chatRequest(CHAT_BODY))).json();
+    expect(data.usage).toEqual(USAGE);
   });
 });

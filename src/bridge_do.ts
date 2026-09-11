@@ -26,9 +26,9 @@ import {
   ToolCallAccumulator,
   applyOpenaiToolConfig,
   buildQoderMessages,
-  extractDelta,
   extractLatestUserPrompt,
   extractMessageImages,
+  extractStreamEvent,
   makeChunk,
   parseToolCallsText,
 } from "./transform";
@@ -405,6 +405,7 @@ export class QoderBridgeDO {
         created,
         openaiModel,
         toolsEnabled,
+        reqBody.stream_options?.include_usage === true,
       );
     }
     return Response.json(
@@ -465,6 +466,7 @@ export class QoderBridgeDO {
     created: number,
     model: string,
     toolsEnabled: boolean,
+    includeUsage: boolean,
   ): Response {
     const encoder = new TextEncoder();
     const self = this;
@@ -479,19 +481,31 @@ export class QoderBridgeDO {
           toolsEnabled,
           (chunk) => controller.enqueue(encoder.encode(chunk)),
         );
+        let usage: Record<string, any> | null = null;
         try {
           upstream = self.openStreamWithRetry(url, body, extraHeaders);
           for await (const line of upstream) {
             if (!line.startsWith("data:")) continue;
-            const delta = extractDelta(line.slice(5).trim());
-            if (!delta.isEmpty()) acc.accept(delta);
+            const event = extractStreamEvent(line.slice(5).trim());
+            if (event.usage !== null) usage = event.usage;
+            if (!event.delta.isEmpty()) acc.accept(event.delta);
           }
           acc.flush();
 
           const done = makeChunk(reqId, created, model);
           done.choices[0].finish_reason = acc.finishReason();
           done.choices[0].delta = {};
+          if (usage !== null && !includeUsage) done.usage = usage;
           controller.enqueue(encoder.encode(`data: ${JSON.stringify(done)}\n\n`));
+
+          if (usage !== null && includeUsage) {
+            const usageChunk = makeChunk(reqId, created, model);
+            usageChunk.choices = [];
+            usageChunk.usage = usage;
+            controller.enqueue(
+              encoder.encode(`data: ${JSON.stringify(usageChunk)}\n\n`),
+            );
+          }
         } catch (e) {
           console.log(`[bridge] stream error: ${e}`);
           try {
@@ -540,10 +554,13 @@ export class QoderBridgeDO {
     const fullContent: string[] = [];
     const fullReasoningContent: string[] = [];
     const toolCalls = new ToolCallAccumulator();
+    let usage: Record<string, any> | null = null;
 
     for await (const line of this.openStreamWithRetry(url, body, extraHeaders)) {
       if (!line.startsWith("data:")) continue;
-      const delta = extractDelta(line.slice(5).trim());
+      const event = extractStreamEvent(line.slice(5).trim());
+      if (event.usage !== null) usage = event.usage;
+      const delta = event.delta;
       if (delta.reasoningContent) fullReasoningContent.push(delta.reasoningContent);
       if (delta.content) fullContent.push(delta.content);
       if (delta.toolCalls && delta.toolCalls.length > 0) {
@@ -584,7 +601,7 @@ export class QoderBridgeDO {
       created,
       model,
       choices: [{ index: 0, message: msg, finish_reason: finishReason }],
-      usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+      usage: usage ?? { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
     };
   }
 }

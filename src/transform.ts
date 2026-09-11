@@ -551,24 +551,94 @@ export function makeSseChunk(
   return `data: ${JSON.stringify(chunk)}\n\n`;
 }
 
-export function extractDelta(dataLine: string): BridgeDelta {
+function parseInnerBody(dataLine: string): Dict | null {
   try {
     const wrapper = JSON.parse(dataLine);
-    const innerStr = wrapper?.body ?? "";
-    if (!innerStr) return new BridgeDelta();
-    const innerJson = JSON.parse(innerStr);
-    for (const ch of innerJson?.choices ?? []) {
-      const delta = ch?.delta ?? {};
-      const role: string = delta.role ?? "";
-      const content: string = delta.content ?? "";
-      const reasoningContent: string = delta.reasoning_content ?? "";
-      const tc = delta.tool_calls;
-      const toolCalls =
-        Array.isArray(tc) && tc.length > 0 ? structuredClone(tc) : null;
-      if (role || content || reasoningContent || toolCalls !== null) {
-        return new BridgeDelta(role, content, reasoningContent, toolCalls);
-      }
+    if (typeof wrapper !== "object" || wrapper === null || Array.isArray(wrapper)) {
+      return null;
     }
-  } catch {}
+    if ("body" in wrapper) {
+      const inner = wrapper.body;
+      if (typeof inner === "object" && inner !== null && !Array.isArray(inner)) {
+        return inner as Dict;
+      }
+      if (typeof inner !== "string" || !inner) return null;
+      const parsed = JSON.parse(inner);
+      return typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)
+        ? (parsed as Dict)
+        : null;
+    }
+    const isChunk =
+      "choices" in wrapper ||
+      "usage" in wrapper ||
+      wrapper.object === "chat.completion.chunk" ||
+      wrapper.object === "chat.completion";
+    return isChunk ? (wrapper as Dict) : null;
+  } catch {
+    return null;
+  }
+}
+
+function deltaFromInner(innerJson: Dict | null): BridgeDelta {
+  if (innerJson === null) return new BridgeDelta();
+  for (const ch of innerJson.choices ?? []) {
+    const delta = ch?.delta ?? {};
+    const role: string = delta.role ?? "";
+    const content: string = delta.content ?? "";
+    const reasoningContent: string = delta.reasoning_content ?? "";
+    const tc = delta.tool_calls;
+    const toolCalls =
+      Array.isArray(tc) && tc.length > 0 ? structuredClone(tc) : null;
+    if (role || content || reasoningContent || toolCalls !== null) {
+      return new BridgeDelta(role, content, reasoningContent, toolCalls);
+    }
+  }
   return new BridgeDelta();
+}
+
+const USAGE_TOKEN_KEYS = [
+  "prompt_tokens",
+  "completion_tokens",
+  "total_tokens",
+  "input_tokens",
+  "output_tokens",
+];
+
+function hasTokenCounts(usage: unknown): boolean {
+  if (typeof usage !== "object" || usage === null || Array.isArray(usage)) {
+    return false;
+  }
+  const u = usage as Dict;
+  return USAGE_TOKEN_KEYS.some((k) => {
+    const v = u[k];
+    if (typeof v === "number") return Number.isFinite(v);
+    if (typeof v !== "string" || !v.trim()) return false;
+    return Number.isFinite(Number(v));
+  });
+}
+
+export function findUsage(innerJson: Dict | null): Dict | null {
+  if (innerJson === null) return null;
+  const candidates: unknown[] = [innerJson.usage, innerJson.response_meta?.usage];
+  for (const ch of innerJson.choices ?? []) {
+    candidates.push(ch?.usage, ch?.response_meta?.usage);
+  }
+  for (const c of candidates) {
+    if (hasTokenCounts(c)) return structuredClone(c) as Dict;
+  }
+  return null;
+}
+
+export interface UpstreamEvent {
+  delta: BridgeDelta;
+  usage: Dict | null;
+}
+
+export function extractStreamEvent(dataLine: string): UpstreamEvent {
+  const innerJson = parseInnerBody(dataLine);
+  return { delta: deltaFromInner(innerJson), usage: findUsage(innerJson) };
+}
+
+export function extractDelta(dataLine: string): BridgeDelta {
+  return deltaFromInner(parseInnerBody(dataLine));
 }

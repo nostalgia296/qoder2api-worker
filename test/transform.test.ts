@@ -8,6 +8,8 @@ import {
   convertIncomingMessage,
   extractDelta,
   extractMessageImages,
+  extractStreamEvent,
+  findUsage,
   makeSseChunk,
   parseToolCallsText,
 } from "../src/transform";
@@ -97,6 +99,116 @@ describe("extractDelta", () => {
   it("returns empty delta for non-JSON / heartbeat lines", () => {
     expect(extractDelta(": keepalive").isEmpty()).toBe(true);
     expect(extractDelta("{}").isEmpty()).toBe(true);
+  });
+});
+
+describe("extractStreamEvent / findUsage", () => {
+  const USAGE = {
+    prompt_tokens: 11,
+    completion_tokens: 7,
+    total_tokens: 18,
+    completion_tokens_details: { reasoning_tokens: 3 },
+    prompt_tokens_details: { cached_tokens: 0 },
+  };
+
+  const line = (inner: Record<string, any>) =>
+    JSON.stringify({ body: JSON.stringify(inner) });
+
+  it("passes through top-level usage verbatim", () => {
+    const ev = extractStreamEvent(line({ choices: [], usage: USAGE }));
+    expect(ev.usage).toEqual(USAGE);
+    expect(ev.delta.isEmpty()).toBe(true);
+  });
+
+  it("finds usage under choices[] and response_meta", () => {
+    expect(
+      extractStreamEvent(line({ choices: [{ delta: {}, usage: USAGE }] })).usage,
+    ).toEqual(USAGE);
+    expect(
+      extractStreamEvent(line({ choices: [], response_meta: { usage: USAGE } }))
+        .usage,
+    ).toEqual(USAGE);
+  });
+
+  it("yields delta and usage from the same line without double parsing", () => {
+    const ev = extractStreamEvent(
+      line({ choices: [{ delta: { content: "hi" } }], usage: USAGE }),
+    );
+    expect(ev.delta.content).toBe("hi");
+    expect(ev.usage).toEqual(USAGE);
+  });
+
+  it("ignores usage objects without token counts", () => {
+    expect(extractStreamEvent(line({ choices: [], usage: {} })).usage).toBeNull();
+    expect(
+      extractStreamEvent(line({ choices: [], usage: { id: "x" } })).usage,
+    ).toBeNull();
+    expect(extractStreamEvent(line({ choices: [] })).usage).toBeNull();
+  });
+
+  it("returns null usage for heartbeat / malformed lines", () => {
+    expect(extractStreamEvent(": keepalive").usage).toBeNull();
+    expect(extractStreamEvent("{}").usage).toBeNull();
+    expect(extractStreamEvent(JSON.stringify({ body: "{oops" })).usage).toBeNull();
+  });
+
+  it("accepts an envelope whose body is already an object", () => {
+    const ev = extractStreamEvent(
+      JSON.stringify({ body: { choices: [{ delta: { content: "x" } }], usage: USAGE } }),
+    );
+    expect(ev.delta.content).toBe("x");
+    expect(ev.usage).toEqual(USAGE);
+  });
+
+  it("accepts a bare chunk frame (no envelope), as the gateway may send for the final metrics frame", () => {
+    const ev = extractStreamEvent(
+      JSON.stringify({
+        id: "up-1",
+        object: "chat.completion.chunk",
+        choices: [{ delta: { content: "tail" }, finish_reason: "stop" }],
+        usage: USAGE,
+        raw_usage: { total: 18 },
+        sub_usages: [{ model: "x" }],
+      }),
+    );
+    expect(ev.delta.content).toBe("tail");
+    expect(ev.usage).toEqual(USAGE);
+  });
+
+  it("accepts numeric-string and Anthropic-style counts, passed through unchanged", () => {
+    expect(
+      extractStreamEvent(
+        line({ choices: [], usage: { prompt_tokens: "11", total_tokens: "18" } }),
+      ).usage,
+    ).toEqual({ prompt_tokens: "11", total_tokens: "18" });
+    expect(
+      extractStreamEvent(
+        line({ choices: [], usage: { input_tokens: 4, output_tokens: 9 } }),
+      ).usage,
+    ).toEqual({ input_tokens: 4, output_tokens: 9 });
+  });
+
+  it("ignores error envelopes and non-metric objects", () => {
+    const ev = extractStreamEvent(
+      JSON.stringify({
+        body: JSON.stringify({ code: "105", message: "Login expired" }),
+        statusCodeValue: 403,
+        statusCode: "FORBIDDEN",
+      }),
+    );
+    expect(ev.usage).toBeNull();
+    expect(ev.delta.isEmpty()).toBe(true);
+    expect(
+      extractStreamEvent(JSON.stringify({ statusCodeValue: 200 })).usage,
+    ).toBeNull();
+  });
+
+  it("returns a detached copy, not the upstream object itself", () => {
+    const inner = { choices: [], usage: { ...USAGE } };
+    const got = findUsage(inner);
+    expect(got).toEqual(USAGE);
+    got!.total_tokens = 999;
+    expect(inner.usage.total_tokens).toBe(18);
   });
 });
 
