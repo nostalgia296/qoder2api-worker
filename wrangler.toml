@@ -2,6 +2,11 @@ name = "qoder2api"
 main = "src/index.js"
 compatibility_date = "2025-09-01"
 
+# 可选: 每日自动签到(UTC 时间; 下例 = 北京时间 09:16)。删除注释即启用,
+# 需同时绑定 QODER_KV(结果落盘) ; 设 vars AUTO_CHECKIN = "false" 可只停签到不删配置
+# [triggers]
+# crons = ["16 1 * * *"]
+
 # 可选: KV 命名空间 —— 启用凭证持久化 / deviceToken 自动刷新落盘 / jobToken 跨隔离缓存
 # 创建并填入 id:
 #   npx wrangler kv namespace create QODER_KV
@@ -14,3 +19,5 @@ compatibility_date = "2025-09-01"
 # QODER_MACHINE_ID = ""
 # 可选: API 鉴权(生产建议用 `wrangler secret put API_KEY`, 不要写在这里)
 # API_KEY = ""
+# 可选: 关闭 cron 自动签到(仅当配置了 [triggers] 时有意义)
+# AUTO_CHECKIN = "false"

@@ -12,16 +12,16 @@ export const DEFAULT_MODEL = 'qfmodel';
 export const MODEL_CATALOG = [
   { id: 'auto', name: 'Auto' },
   { id: 'lite', name: 'Lite' },
-  { id: 'qfmodel', name: 'Qwen3.7-Flash' },
+  { id: 'qfmodel', name: 'Qwen3.8-Flash' },
   { id: 'qmodel', name: 'Qwen3.7-Plus' },
   { id: 'qmodel_38max', name: 'Qwen3.8-Max' },
-  { id: 'qmodel_latest', name: 'Qwen3.8-Flash' },
+  { id: 'qmodel_latest', name: 'Qwen' },
   { id: 'dfmodel', name: 'DeepSeek-V4-Flash' },
   { id: 'dmodel', name: 'DeepSeek-V4-Pro' },
   { id: 'gfmodel', name: 'GLM-5.3-Flash' },
   { id: 'gmodel', name: 'GLM-5.3' },
   { id: 'kmodel', name: 'Kimi-K2.7-Code' },
-  { id: 'kmodel_latest', name: 'Kimi-K3' },
+  { id: 'kmodel_latest', name: 'Kimi-K2.7-Code-Latest' },
   { id: 'mmodel', name: 'MiniMax-M3' },
   { id: 'cmodel', name: 'Cantus' },
 ];
@@ -284,6 +284,32 @@ export async function prepareChat(env, { model, messages, tools, parameters, eff
   return { url, headers, body: bodyStr };
 }
 
+export function findQueueInfo(value, depth = 0) {
+  if (depth > 6 || !value || typeof value !== 'object') return null;
+  if (String(value.code) === '10605') {
+    let q = value;
+    if (typeof value.message === 'string') {
+      try { q = JSON.parse(value.message); } catch {}
+    }
+    return q && typeof q === 'object' ? q : {};
+  }
+  if (value.isQueued !== undefined) return value;
+  for (const k of ['data', 'result', 'message', 'body']) {
+    const v = value[k];
+    if (!v) continue;
+    if (typeof v === 'object') {
+      const r = findQueueInfo(v, depth + 1);
+      if (r) return r;
+    } else if (typeof v === 'string') {
+      try {
+        const r = findQueueInfo(JSON.parse(v), depth + 1);
+        if (r) return r;
+      } catch {}
+    }
+  }
+  return null;
+}
+
 export async function* streamDeltas(response) {
   const reader = response.body.getReader();
   const dec = new TextDecoder();
@@ -305,7 +331,11 @@ export async function* streamDeltas(response) {
           const env2 = JSON.parse(p);
           inner = JSON.parse(env2.body || '{}');
         } catch { continue; }
-        if (inner.code) throw new HttpError(Number(inner.statusCodeValue) || 502, inner.message || 'gateway error');
+        if (inner.code) {
+          const q = findQueueInfo(inner);
+          if (q) throw new HttpError(429, `upstream busy: ${JSON.stringify(q).slice(0, 200)}`);
+          throw new HttpError(Number(inner.statusCodeValue) || 502, inner.message || 'gateway error');
+        }
         const ch = inner.choices?.[0];
         const d = ch ? (ch.delta ?? ch.message ?? null) : null;
         const hasDelta = d && (d.content || d.reasoning_content || (Array.isArray(d.tool_calls) && d.tool_calls.length));

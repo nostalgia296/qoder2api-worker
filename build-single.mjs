@@ -6,7 +6,7 @@ const HERE = path.dirname(fileURLToPath(import.meta.url));
 const OUT = path.join(HERE, 'dist');
 fs.mkdirSync(OUT, { recursive: true });
 
-const modules = ['src/wasm/wasm-b64.js', 'src/wasm/glue.js', 'src/crypto.js', 'src/qoder.js'];
+const modules = ['src/wasm/wasm-b64.js', 'src/wasm/glue.js', 'src/crypto.js', 'src/qoder.js', 'src/login.js', 'src/checkin.js'];
 
 let out = '';
 for (const rel of modules) {

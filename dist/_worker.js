@@ -368,6 +368,32 @@ export async function prepareChat(env, { model, messages, tools, parameters, eff
   return { url, headers, body: bodyStr };
 }
 
+function findQueueInfo(value, depth = 0) {
+  if (depth > 6 || !value || typeof value !== 'object') return null;
+  if (String(value.code) === '10605') {
+    let q = value;
+    if (typeof value.message === 'string') {
+      try { q = JSON.parse(value.message); } catch {}
+    }
+    return q && typeof q === 'object' ? q : {};
+  }
+  if (value.isQueued !== undefined) return value;
+  for (const k of ['data', 'result', 'message', 'body']) {
+    const v = value[k];
+    if (!v) continue;
+    if (typeof v === 'object') {
+      const r = findQueueInfo(v, depth + 1);
+      if (r) return r;
+    } else if (typeof v === 'string') {
+      try {
+        const r = findQueueInfo(JSON.parse(v), depth + 1);
+        if (r) return r;
+      } catch {}
+    }
+  }
+  return null;
+}
+
 export async function* streamDeltas(response) {
   const reader = response.body.getReader();
   const dec = new TextDecoder();
@@ -389,7 +415,11 @@ export async function* streamDeltas(response) {
           const env2 = JSON.parse(p);
           inner = JSON.parse(env2.body || '{}');
         } catch { continue; }
-        if (inner.code) throw new HttpError(Number(inner.statusCodeValue) || 502, inner.message || 'gateway error');
+        if (inner.code) {
+          const q = findQueueInfo(inner);
+          if (q) throw new HttpError(429, `upstream busy: ${JSON.stringify(q).slice(0, 200)}`);
+          throw new HttpError(Number(inner.statusCodeValue) || 502, inner.message || 'gateway error');
+        }
         const ch = inner.choices?.[0];
         const d = ch ? (ch.delta ?? ch.message ?? null) : null;
         const hasDelta = d && (d.content || d.reasoning_content || (Array.isArray(d.tool_calls) && d.tool_calls.length));
@@ -400,6 +430,200 @@ export async function* streamDeltas(response) {
       }
     }
   }
+}
+const AUTH_BASE = 'https://qoder.cn';
+const LOGIN_TTL = 600;            
+const POLL_INTERVAL = 1000;       
+const POLL_TIMEOUT_MAX = 300_000; 
+
+const ALPHABET = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~';
+
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+function b64urlEncode(bytes) {
+  let bin = '';
+  for (const b of bytes) bin += String.fromCharCode(b);
+  return btoa(bin).replaceAll('+', '-').replaceAll('/', '_').replace(/=+$/, '');
+}
+
+function makeVerifier() {
+  const bytes = new Uint8Array(64);
+  crypto.getRandomValues(bytes);
+  return Array.from(bytes, b => ALPHABET[b % ALPHABET.length]).join('');
+}
+
+async function challengeOf(verifier) {
+  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(verifier));
+  return b64urlEncode(new Uint8Array(digest));
+}
+
+function requireKv(env) {
+  if (!env.QODER_KV) {
+    throw new HttpError(400, '登录流程需要绑定 QODER_KV（跨请求保存 PKCE 会话）, 在 wrangler.toml 配置后重新部署', 'configuration_error');
+  }
+}
+
+export async function startLogin(env) {
+  requireKv(env);
+  const machineId = crypto.randomUUID(); 
+  const nonce = crypto.randomUUID();
+  const verifier = makeVerifier();
+  const challenge = await challengeOf(verifier);
+
+  const selectAccounts = new URL('/device/selectAccounts', AUTH_BASE);
+  selectAccounts.search = new URLSearchParams({
+    challenge, challenge_method: 'S256', nonce, machine_id: machineId, client_id: CLIENT_ID,
+  }).toString();
+  const loginUrl = new URL('/users/sign-in', selectAccounts.origin);
+  loginUrl.searchParams.set('biz_variant', 'qoder');
+  loginUrl.searchParams.set('oauth_callback', selectAccounts.toString());
+
+  await env.QODER_KV.put(`login:${nonce}`, JSON.stringify({
+    verifier, challenge, machine_id: machineId, created: Date.now(),
+  }), { expirationTtl: LOGIN_TTL });
+
+  return {
+    nonce,
+    machine_id: machineId,
+    login_url: loginUrl.toString(),
+    direct_url: selectAccounts.toString(), 
+    expires_in: LOGIN_TTL,
+  };
+}
+
+export async function waitLogin(env, nonce, timeoutMs) {
+  requireKv(env);
+  if (!nonce) throw new HttpError(400, '缺少 nonce（来自 POST /admin/login 响应）', 'invalid_request_error');
+  const raw = await env.QODER_KV.get(`login:${nonce}`);
+  if (!raw) throw new HttpError(404, '登录会话不存在或已过期, 重新 POST /admin/login');
+  const sess = JSON.parse(raw);
+
+  const deadline = Date.now() + Math.min(Number(timeoutMs) || POLL_TIMEOUT_MAX, POLL_TIMEOUT_MAX);
+  const pollUrl = new URL('/api/v1/deviceToken/poll', OPENAPI);
+  pollUrl.search = new URLSearchParams({ nonce, verifier: sess.verifier, challenge_method: 'S256' }).toString();
+
+  while (true) {
+    const r = await fetch(pollUrl, { headers: { Accept: 'application/json' } });
+    if (r.ok) {
+      const d = await r.json();
+      if (typeof d.token !== 'string' || typeof d.refresh_token !== 'string') {
+        throw new HttpError(502, 'poll 响应缺少 token/refresh_token');
+      }
+      const creds = await buildCreds(sess, nonce, d);
+      await saveCreds(env, creds);
+      try { await env.QODER_KV.delete(`login:${nonce}`); } catch {}
+      return {
+        ok: true,
+        token: creds.token.slice(0, 12) + '...',
+        has_refresh_token: true,
+        user: creds.userinfo,
+        machine_id: creds.machine_id,
+        expires_at: creds.expires_at || null,
+      };
+    }
+    if (r.status !== 404) throw new HttpError(502, `poll HTTP ${r.status}`);
+    if (Date.now() + POLL_INTERVAL > deadline) {
+      return { ok: false, reason: 'pending', message: '用户尚未完成授权, 在浏览器打开 login_url 后重试本接口' };
+    }
+    await sleep(POLL_INTERVAL);
+  }
+}
+
+async function buildCreds(sess, nonce, pollBody) {
+  const creds = {
+    token: pollBody.token,
+    refresh_token: pollBody.refresh_token,
+    nonce,
+    verifier: sess.verifier,
+    challenge: sess.challenge,
+    machine_id: sess.machine_id,
+    env: 'prod',
+    ts: new Date().toISOString(),
+  };
+  if (pollBody.expires_at) creds.expires_at = pollBody.expires_at;
+  else if (pollBody.expires_in) creds.expires_at = new Date(Date.now() + Number(pollBody.expires_in)).toISOString();
+  if (pollBody.refresh_token_expires_at) creds.refresh_token_expires_at = pollBody.refresh_token_expires_at;
+  else if (pollBody.refresh_token_expires_in) creds.refresh_token_expires_at = new Date(Date.now() + Number(pollBody.refresh_token_expires_in)).toISOString();
+
+  const r = await fetch(new URL('/api/v1/userinfo', OPENAPI), {
+    headers: { Accept: 'application/json', Authorization: `Bearer ${creds.token}` },
+  });
+  if (!r.ok) throw new HttpError(502, `userinfo HTTP ${r.status}`);
+  const u = await r.json();
+  creds.userinfo = {
+    id: u.id ?? u.user_id ?? u.uid ?? '',
+    name: u.name ?? u.username ?? u.user_name ?? '',
+    email: u.email ?? '',
+  };
+  return creds;
+}
+function campaignHeaders(token) {
+  return {
+    Accept: 'application/json',
+    'Content-Type': 'application/json',
+    'User-Agent': 'Qoder',
+    Authorization: `Bearer ${token}`,
+    'Cosy-ClientType': '10',
+    'Cosy-Version': '0.3.3',
+  };
+}
+
+async function campaignsApi(env, creds, method, path, body) {
+  let r = await fetch(OPENAPI + path, { method, headers: campaignHeaders(creds.token), body: body ? JSON.stringify(body) : undefined });
+  if ((r.status === 401 || r.status === 403) && creds.refresh_token) {
+    const updated = await refreshDeviceToken(env, creds);
+    r = await fetch(OPENAPI + path, { method, headers: campaignHeaders(updated.token), body: body ? JSON.stringify(body) : undefined });
+  }
+  let j = null;
+  try { j = await r.json(); } catch { j = { raw: 'non-json response' }; }
+  if (r.status !== 200) {
+    throw new HttpError(r.status === 401 || r.status === 403 ? 401 : 502, `campaigns HTTP ${r.status}: ${JSON.stringify(j).slice(0, 200)}`);
+  }
+  return j;
+}
+
+export async function listCampaigns(env) {
+  const creds = await resolveCreds(env);
+  const j = await campaignsApi(env, creds, 'GET', '/sash/api/v1/me/campaigns');
+  return {
+    showCampaign: j.showCampaign ?? null,
+    claimable: j.claimable ?? null,
+    campaignUrl: j.campaignUrl ?? null,
+    campaigns: j.campaigns || [],
+  };
+}
+
+export async function runCheckin(env) {
+  const creds = await resolveCreds(env);
+  const list = await campaignsApi(env, creds, 'GET', '/sash/api/v1/me/campaigns');
+  const campaigns = list.campaigns || [];
+  const targets = campaigns.filter(c => c.actionType === 'CLAIM_BENEFIT' && c.claimStatus === 'CLAIMABLE');
+  const results = [];
+  let granted = 0;
+  for (const c of targets) {
+    const j = await campaignsApi(env, creds, 'POST', `/sash/api/v1/me/campaigns/${c.campaignId}/claim`, {});
+    results.push({
+      campaignKey: c.campaignKey,
+      campaignId: c.campaignId,
+      status: j.status ?? null,
+      replayed: !!j.replayed,
+      grantId: j.grantId ?? null,
+      failureCode: j.failureCode ?? null,
+      benefit: j.benefit ?? null,
+    });
+    if (j.status === 'GRANTED') granted += j.benefit?.amount || 0;
+  }
+  return { ok: true, granted, claimed: results.length, results, campaigns };
+}
+
+export async function lastCheckin(env) {
+  if (!env.QODER_KV) return null;
+  try { return await env.QODER_KV.get('checkin:last', 'json'); } catch { return null; }
+}
+
+export async function recordCheckin(env, outcome) {
+  if (!env.QODER_KV) return;
+  try { await env.QODER_KV.put('checkin:last', JSON.stringify(outcome)); } catch {}
 }
 const CORS = {
   'Access-Control-Allow-Origin': '*',
@@ -474,9 +698,34 @@ export default {
       return errResp(500, e?.message || String(e));
     }
   },
+
+  async scheduled(controller, env) {
+    if (env.AUTO_CHECKIN === 'false') return;
+    const at = new Date().toISOString();
+    try {
+      const result = await runCheckin(env);
+      await recordCheckin(env, {
+        at, ok: true, granted: result.granted, claimed: result.claimed,
+        results: result.results,
+      });
+    } catch (e) {
+      await recordCheckin(env, { at, ok: false, error: e?.message || String(e) });
+    }
+  },
 };
 
 async function handleAdmin(request, env, path) {
+  if (request.method === 'POST' && path === '/admin/checkin') {
+    const result = await runCheckin(env);
+    await recordCheckin(env, {
+      at: new Date().toISOString(), ok: true, granted: result.granted,
+      claimed: result.claimed, results: result.results, manual: true,
+    });
+    return json(result);
+  }
+  if (request.method === 'GET' && path === '/admin/campaigns') {
+    return json(await listCampaigns(env));
+  }
   if (request.method === 'POST' && path === '/admin/login') {
     return json(await startLogin(env));
   }
@@ -519,11 +768,92 @@ async function handleAdmin(request, env, path) {
       user: creds.userinfo ? { id: creds.userinfo.id, name: creds.userinfo.name } : null,
       jobToken_cached: !!jt,
       jobToken_expires_at: jt ? new Date(jt.expiresAt).toISOString() : null,
+      last_checkin: await lastCheckin(env),
       kv_bound: !!env.QODER_KV,
       api_key_required: !!env.API_KEY,
     });
   }
   return errResp(404, `Unknown admin route: ${request.method} ${path}`, 'invalid_request_error');
+}
+
+function parseQueueInfo(inner) {
+  if (inner?.code === undefined && inner?.statusCodeValue === undefined) return null;
+  return findQueueInfo(inner);
+}
+
+function rebufferStream(reader, head) {
+  const enc = new TextEncoder();
+  let flushed = false;
+  return new ReadableStream({
+    async pull(ctrl) {
+      if (!flushed) {
+        flushed = true;
+        if (head) ctrl.enqueue(enc.encode(head));
+        return;
+      }
+      const { done, value } = await reader.read();
+      if (done) ctrl.close();
+      else ctrl.enqueue(value);
+    },
+  });
+}
+
+const QUEUE_MAX_ATTEMPTS = 5;
+const QUEUE_DEFAULT_WAIT_MS = 2000;
+const QUEUE_MAX_WAIT_MS = 30000;
+
+const sleepMs = ms => new Promise(r => setTimeout(r, ms));
+
+function queueWaitMs(q, maxWait) {
+  let s = Number(q?.retryAfterSeconds);
+  if (!Number.isFinite(s) || s <= 0) {
+    const w = Number(q?.waitTime);
+    s = Number.isFinite(w) && w > 0 ? (w >= 10 ? w : w / 1000) : 2;
+  }
+  return Math.min(maxWait, Math.max(1000, s * 1000));
+}
+
+async function openChatStream(env, chatOpts) {
+  const maxAttempts = Number(env.QUEUE_MAX_ATTEMPTS) || QUEUE_MAX_ATTEMPTS;
+  const maxWait = Number(env.QUEUE_MAX_WAIT_MS) || QUEUE_MAX_WAIT_MS;
+  for (let attempt = 1; ; attempt++) {
+    const prepared = await prepareChat(env, chatOpts);
+    const res = await fetch(prepared.url, { method: 'POST', headers: prepared.headers, body: prepared.body });
+    if (!res.ok) {
+      const text = await res.text();
+      let queue = null;
+      try { queue = parseQueueInfo(JSON.parse(text)); } catch {}
+      if (queue && attempt < maxAttempts) {
+        await sleepMs(queueWaitMs(queue, maxWait));
+        continue;
+      }
+      return { notOk: { status: queue ? 429 : res.status, text } };
+    }
+    const reader = res.body.getReader();
+    const dec = new TextDecoder();
+    let buf = '', queued = null;
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buf += dec.decode(value, { stream: true });
+      const i = buf.indexOf('\n\n');
+      if (i === -1) continue;
+      const line = buf.slice(0, i).split('\n').find(l => l.startsWith('data:'));
+      if (line) {
+        try {
+          const env2 = JSON.parse(line.slice(5).trim());
+          const inner = JSON.parse(env2.body || '{}');
+          queued = parseQueueInfo(inner);
+        } catch {}
+      }
+      break;
+    }
+    if (!queued || attempt >= maxAttempts) {
+      return { res: { body: rebufferStream(reader, buf) } };
+    }
+    try { reader.cancel(); } catch {}
+    await sleepMs(queueWaitMs(queued, maxWait));
+  }
 }
 
 async function handleChat(request, env) {
@@ -543,22 +873,21 @@ async function handleChat(request, env) {
 
   let upstream;
   try {
-    const prepared = await prepareChat(env, { model, messages: mapped, tools, parameters, effort });
-    upstream = await fetch(prepared.url, { method: 'POST', headers: prepared.headers, body: prepared.body });
+    upstream = await openChatStream(env, { model, messages: mapped, tools, parameters, effort });
   } catch (e) {
     if (e instanceof HttpError) return errResp(e.status, e.message, e.type);
     return errResp(502, `upstream request failed: ${e?.message || e}`);
   }
-  if (!upstream.ok) {
-    const t = await upstream.text();
-    const status = upstream.status === 401 || upstream.status === 403 ? 401 : upstream.status === 402 ? 402 : 502;
-    return errResp(status, `gateway HTTP ${upstream.status}: ${t.slice(0, 300)}`);
+  if (upstream.notOk) {
+    const { status, text } = upstream.notOk;
+    const mapped = [401, 402, 403, 429].includes(status) ? status : 502;
+    return errResp(mapped, `gateway HTTP ${status}: ${text.slice(0, 300)}`);
   }
 
   if (!stream) {
     let text = '', thinking = '', finish = 'stop', usage = null;
     const toolCalls = [];
-    for await (const ev of streamDeltas(upstream)) {
+    for await (const ev of streamDeltas(upstream.res)) {
       if (ev.usage) usage = ev.usage;
       const d = ev.delta;
       if (d) {
@@ -594,7 +923,7 @@ async function handleChat(request, env) {
       chunk({ role: 'assistant', content: '' });
       let finish = 'stop', usage = null;
       try {
-        for await (const ev of streamDeltas(upstream)) {
+        for await (const ev of streamDeltas(upstream.res)) {
           if (ev.usage) usage = ev.usage;
           const d = ev.delta;
           if (d) {

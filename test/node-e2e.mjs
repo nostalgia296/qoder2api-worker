@@ -53,6 +53,8 @@ const env = {
     },
   }),
   API_KEY: 'test-key-123',
+  QUEUE_MAX_ATTEMPTS: '2',
+  QUEUE_MAX_WAIT_MS: '1500',
 };
 
 const req = (path, init) => new Request(`http://localhost${path}`, init);
@@ -62,6 +64,10 @@ const check = (name, ok, extra = '') => {
   console.log(`${ok ? 'PASS' : 'FAIL'}  ${name}${extra ? '  ' + extra : ''}`);
   if (!ok) failed++;
 };
+
+const queueBusy = j => /isQueued|10605/.test(j?.error?.message || '');
+let skipped = 0;
+const skip = name => { console.log(`SKIP  ${name}  (upstream p3 queue)`); skipped++; };
 
 {
   const r = await handler.fetch(req('/health'), env, {});
@@ -92,10 +98,13 @@ const check = (name, ok, extra = '') => {
     body: JSON.stringify({ model: 'qfmodel', messages: [{ role: 'system', content: '你是简洁的助手' }, { role: 'user', content: '用一句话介绍你自己' }] }),
   }), env, {});
   const j = await r.json();
-  check('non-stream 200', r.status === 200, `${Date.now() - t0}ms`);
-  check('non-stream content', typeof j.choices?.[0]?.message?.content === 'string' && j.choices[0].message.content.length > 0, JSON.stringify(j.choices?.[0]?.message?.content?.slice(0, 60)));
-  check('non-stream shape', j.object === 'chat.completion' && j.id.startsWith('chatcmpl-') && j.choices[0].finish_reason === 'stop');
-  check('non-stream usage', typeof j.usage?.total_tokens === 'number' && j.usage.total_tokens > 0 && j.usage.prompt_tokens > 0, `total=${j.usage?.total_tokens} prompt=${j.usage?.prompt_tokens} credits=${j.usage?.credits}`);
+  if (queueBusy(j)) { skip('non-stream group'); }
+  else {
+    check('non-stream 200', r.status === 200, `${Date.now() - t0}ms`);
+    check('non-stream content', typeof j.choices?.[0]?.message?.content === 'string' && j.choices[0].message.content.length > 0, JSON.stringify(j.choices?.[0]?.message?.content?.slice(0, 60)));
+    check('non-stream shape', j.object === 'chat.completion' && j.id.startsWith('chatcmpl-') && j.choices[0].finish_reason === 'stop');
+    check('non-stream usage', typeof j.usage?.total_tokens === 'number' && j.usage.total_tokens > 0 && j.usage.prompt_tokens > 0, `total=${j.usage?.total_tokens} prompt=${j.usage?.prompt_tokens} credits=${j.usage?.credits}`);
+  }
 }
 
 {
@@ -122,11 +131,14 @@ const check = (name, ok, extra = '') => {
       if (o.usage) finishUsage = o.usage;
     }
   }
-  check('stream [DONE]', doneOk);
-  check('stream stop chunk', stopOk);
-  check('stream has content', content.length > 0, JSON.stringify(content.slice(0, 60)));
-  check('stream no error event', !err, err ? JSON.stringify(err) : '');
-  check('stream finish-chunk usage', typeof finishUsage?.total_tokens === 'number' && finishUsage.total_tokens > 0, `total=${finishUsage?.total_tokens}`);
+  if (err && /isQueued|10605/.test(err.message || '')) { skip('stream group'); }
+  else {
+    check('stream [DONE]', doneOk);
+    check('stream stop chunk', stopOk);
+    check('stream has content', content.length > 0, JSON.stringify(content.slice(0, 60)));
+    check('stream no error event', !err, err ? JSON.stringify(err) : '');
+    check('stream finish-chunk usage', typeof finishUsage?.total_tokens === 'number' && finishUsage.total_tokens > 0, `total=${finishUsage?.total_tokens}`);
+  }
 }
 
 {
@@ -137,7 +149,8 @@ const check = (name, ok, extra = '') => {
     body: JSON.stringify({ model: 'qfmodel', messages: [{ role: 'user', content: '回复"ok"两个字母即可' }] }),
   }), env, {});
   const j = await r.json();
-  check('kv re-request 200', r.status === 200 && (j.choices?.[0]?.message?.content?.length || 0) > 0, `kvHits ${before}→${kvHits}`);
+  if (queueBusy(j)) { skip('kv re-request'); }
+  else check('kv re-request 200', r.status === 200 && (j.choices?.[0]?.message?.content?.length || 0) > 0, `kvHits ${before}→${kvHits}`);
 }
 
 {
@@ -184,7 +197,7 @@ const TOOLS_E2E = [{
 }];
 
 {
-  let ok = false, detail = '';
+  let ok = false, detail = '', wasSkipped = false;
   for (let attempt = 0; attempt < 2 && !ok; attempt++) {
     const r = await handler.fetch(req('/v1/chat/completions', {
       method: 'POST',
@@ -196,6 +209,7 @@ const TOOLS_E2E = [{
       }),
     }), env, {});
     const j = await r.json();
+    if (queueBusy(j)) { wasSkipped = true; skip('non-stream tool_calls'); break; }
     const m = j.choices?.[0]?.message;
     ok = r.status === 200 && Array.isArray(m?.tool_calls) && m.tool_calls.length > 0 &&
       m.tool_calls[0]?.function?.name === 'get_weather' &&
@@ -203,11 +217,11 @@ const TOOLS_E2E = [{
       j.choices[0].finish_reason === 'tool_calls';
     detail = `${r.status} ${JSON.stringify(m?.tool_calls?.[0]?.function || (m?.content || '').slice(0, 50) || j).slice(0, 120)}`;
   }
-  check('non-stream tool_calls', ok, detail);
+  if (!wasSkipped) check('non-stream tool_calls', ok, detail);
 }
 
 {
-  let ok = false, detail = '';
+  let ok = false, detail = '', wasSkipped = false;
   for (let attempt = 0; attempt < 2 && !ok; attempt++) {
     const r = await handler.fetch(req('/v1/chat/completions', {
       method: 'POST',
@@ -219,6 +233,7 @@ const TOOLS_E2E = [{
       }),
     }), env, {});
     const text = await r.text();
+    if (/isQueued|10605/.test(text)) { wasSkipped = true; skip('stream tool_calls'); break; }
     const lines = text.split('\n').filter(l => l.startsWith('data: '));
     let sawToolCall = false, lastFinish = null;
     for (const l of lines) {
@@ -233,7 +248,7 @@ const TOOLS_E2E = [{
     ok = r.status === 200 && sawToolCall && lastFinish === 'tool_calls' && lines[lines.length - 1] === 'data: [DONE]';
     detail = `${r.status} sawToolCall=${sawToolCall} finish=${lastFinish}`;
   }
-  check('stream tool_calls', ok, detail);
+  if (!wasSkipped) check('stream tool_calls', ok, detail);
 }
 
 {
@@ -251,15 +266,18 @@ const TOOLS_E2E = [{
     }),
   }), env, {});
   const j = await r.json();
-  const m = j.choices?.[0]?.message;
-  const produced = (m?.content?.length || 0) > 0 || (Array.isArray(m?.tool_calls) && m.tool_calls.length > 0);
-  check('tool result roundtrip', r.status === 200 && produced && !!j.choices?.[0]?.finish_reason,
-    JSON.stringify((m?.content || '').slice(0, 60) || m?.tool_calls?.[0]?.function).slice(0, 100));
+  if (queueBusy(j)) { skip('tool result roundtrip'); }
+  else {
+    const m = j.choices?.[0]?.message;
+    const produced = (m?.content?.length || 0) > 0 || (Array.isArray(m?.tool_calls) && m.tool_calls.length > 0);
+    check('tool result roundtrip', r.status === 200 && produced && !!j.choices?.[0]?.finish_reason,
+      JSON.stringify((m?.content || '').slice(0, 60) || m?.tool_calls?.[0]?.function || 'empty').slice(0, 100));
+  }
 }
 
 {
   const dataUrl = `data:image/png;base64,${makeRedPng().toString('base64')}`;
-  let ok = false, detail = '';
+  let ok = false, detail = '', wasSkipped = false;
   for (let attempt = 0; attempt < 2 && !ok; attempt++) {
     const r = await handler.fetch(req('/v1/chat/completions', {
       method: 'POST',
@@ -276,11 +294,28 @@ const TOOLS_E2E = [{
       }),
     }), env, {});
     const j = await r.json();
+    if (queueBusy(j)) { wasSkipped = true; skip('vision image_url(data URL)'); break; }
     const answer = j.choices?.[0]?.message?.content || '';
     ok = r.status === 200 && /红|red/i.test(answer);
     detail = `${r.status} answer=${JSON.stringify(answer.slice(0, 60))}`;
   }
-  check('vision image_url(data URL)', ok, detail);
+  if (!wasSkipped) check('vision image_url(data URL)', ok, detail);
+}
+
+{
+  const r = await handler.fetch(req('/admin/campaigns', { headers: { Authorization: 'Bearer test-key-123' } }), env, {});
+  const j = await r.json();
+  check('admin/campaigns', r.status === 200 && Array.isArray(j.campaigns), `${j.campaigns?.length} campaigns, claimable=${j.claimable}`);
+
+  const r2 = await handler.fetch(req('/admin/checkin', { method: 'POST', headers: { Authorization: 'Bearer test-key-123' } }), env, {});
+  const j2 = await r2.json();
+  const claimedOk = r2.status === 200 && j2.ok === true && typeof j2.granted === 'number' &&
+    Array.isArray(j2.results) && Array.isArray(j2.campaigns);
+  check('admin/checkin', claimedOk, `granted=${j2.granted} claimed=${j2.claimed} campaigns=${j2.campaigns?.length} ${JSON.stringify(j2.results?.map(x => x.status + (x.failureCode ? ':' + x.failureCode : '')))}`);
+
+  const r3 = await handler.fetch(req('/admin/status', { headers: { Authorization: 'Bearer test-key-123' } }), env, {});
+  const j3 = await r3.json();
+  check('admin/status last_checkin', r3.status === 200 && j3.last_checkin?.ok === true, `granted=${j3.last_checkin?.granted}`);
 }
 
 console.log(failed ? `\n== ${failed} FAILED ==` : '\n== ALL PASS ==');

@@ -2,9 +2,11 @@ import {
   HttpError, MODEL_CATALOG, DEFAULT_MODEL,
   resolveCreds, saveCreds, refreshDeviceToken,
   prepareChat, streamDeltas, mapEffort, mapMessages, mapTools, mapParameters,
+  findQueueInfo,
   jobTokenCacheState,
 } from './qoder.js';
 import { startLogin, waitLogin } from './login.js';
+import { listCampaigns, runCheckin, lastCheckin, recordCheckin } from './checkin.js';
 
 const CORS = {
   'Access-Control-Allow-Origin': '*',
@@ -79,9 +81,34 @@ export default {
       return errResp(500, e?.message || String(e));
     }
   },
+
+  async scheduled(controller, env) {
+    if (env.AUTO_CHECKIN === 'false') return;
+    const at = new Date().toISOString();
+    try {
+      const result = await runCheckin(env);
+      await recordCheckin(env, {
+        at, ok: true, granted: result.granted, claimed: result.claimed,
+        results: result.results,
+      });
+    } catch (e) {
+      await recordCheckin(env, { at, ok: false, error: e?.message || String(e) });
+    }
+  },
 };
 
 async function handleAdmin(request, env, path) {
+  if (request.method === 'POST' && path === '/admin/checkin') {
+    const result = await runCheckin(env);
+    await recordCheckin(env, {
+      at: new Date().toISOString(), ok: true, granted: result.granted,
+      claimed: result.claimed, results: result.results, manual: true,
+    });
+    return json(result);
+  }
+  if (request.method === 'GET' && path === '/admin/campaigns') {
+    return json(await listCampaigns(env));
+  }
   if (request.method === 'POST' && path === '/admin/login') {
     return json(await startLogin(env));
   }
@@ -124,11 +151,92 @@ async function handleAdmin(request, env, path) {
       user: creds.userinfo ? { id: creds.userinfo.id, name: creds.userinfo.name } : null,
       jobToken_cached: !!jt,
       jobToken_expires_at: jt ? new Date(jt.expiresAt).toISOString() : null,
+      last_checkin: await lastCheckin(env),
       kv_bound: !!env.QODER_KV,
       api_key_required: !!env.API_KEY,
     });
   }
   return errResp(404, `Unknown admin route: ${request.method} ${path}`, 'invalid_request_error');
+}
+
+function parseQueueInfo(inner) {
+  if (inner?.code === undefined && inner?.statusCodeValue === undefined) return null;
+  return findQueueInfo(inner);
+}
+
+function rebufferStream(reader, head) {
+  const enc = new TextEncoder();
+  let flushed = false;
+  return new ReadableStream({
+    async pull(ctrl) {
+      if (!flushed) {
+        flushed = true;
+        if (head) ctrl.enqueue(enc.encode(head));
+        return;
+      }
+      const { done, value } = await reader.read();
+      if (done) ctrl.close();
+      else ctrl.enqueue(value);
+    },
+  });
+}
+
+const QUEUE_MAX_ATTEMPTS = 5;
+const QUEUE_DEFAULT_WAIT_MS = 2000;
+const QUEUE_MAX_WAIT_MS = 30000;
+
+const sleepMs = ms => new Promise(r => setTimeout(r, ms));
+
+function queueWaitMs(q, maxWait) {
+  let s = Number(q?.retryAfterSeconds);
+  if (!Number.isFinite(s) || s <= 0) {
+    const w = Number(q?.waitTime);
+    s = Number.isFinite(w) && w > 0 ? (w >= 10 ? w : w / 1000) : 2;
+  }
+  return Math.min(maxWait, Math.max(1000, s * 1000));
+}
+
+async function openChatStream(env, chatOpts) {
+  const maxAttempts = Number(env.QUEUE_MAX_ATTEMPTS) || QUEUE_MAX_ATTEMPTS;
+  const maxWait = Number(env.QUEUE_MAX_WAIT_MS) || QUEUE_MAX_WAIT_MS;
+  for (let attempt = 1; ; attempt++) {
+    const prepared = await prepareChat(env, chatOpts);
+    const res = await fetch(prepared.url, { method: 'POST', headers: prepared.headers, body: prepared.body });
+    if (!res.ok) {
+      const text = await res.text();
+      let queue = null;
+      try { queue = parseQueueInfo(JSON.parse(text)); } catch {}
+      if (queue && attempt < maxAttempts) {
+        await sleepMs(queueWaitMs(queue, maxWait));
+        continue;
+      }
+      return { notOk: { status: queue ? 429 : res.status, text } };
+    }
+    const reader = res.body.getReader();
+    const dec = new TextDecoder();
+    let buf = '', queued = null;
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buf += dec.decode(value, { stream: true });
+      const i = buf.indexOf('\n\n');
+      if (i === -1) continue;
+      const line = buf.slice(0, i).split('\n').find(l => l.startsWith('data:'));
+      if (line) {
+        try {
+          const env2 = JSON.parse(line.slice(5).trim());
+          const inner = JSON.parse(env2.body || '{}');
+          queued = parseQueueInfo(inner);
+        } catch {}
+      }
+      break;
+    }
+    if (!queued || attempt >= maxAttempts) {
+      return { res: { body: rebufferStream(reader, buf) } };
+    }
+    try { reader.cancel(); } catch {}
+    await sleepMs(queueWaitMs(queued, maxWait));
+  }
 }
 
 async function handleChat(request, env) {
@@ -148,22 +256,21 @@ async function handleChat(request, env) {
 
   let upstream;
   try {
-    const prepared = await prepareChat(env, { model, messages: mapped, tools, parameters, effort });
-    upstream = await fetch(prepared.url, { method: 'POST', headers: prepared.headers, body: prepared.body });
+    upstream = await openChatStream(env, { model, messages: mapped, tools, parameters, effort });
   } catch (e) {
     if (e instanceof HttpError) return errResp(e.status, e.message, e.type);
     return errResp(502, `upstream request failed: ${e?.message || e}`);
   }
-  if (!upstream.ok) {
-    const t = await upstream.text();
-    const status = upstream.status === 401 || upstream.status === 403 ? 401 : upstream.status === 402 ? 402 : 502;
-    return errResp(status, `gateway HTTP ${upstream.status}: ${t.slice(0, 300)}`);
+  if (upstream.notOk) {
+    const { status, text } = upstream.notOk;
+    const mapped = [401, 402, 403, 429].includes(status) ? status : 502;
+    return errResp(mapped, `gateway HTTP ${status}: ${text.slice(0, 300)}`);
   }
 
   if (!stream) {
     let text = '', thinking = '', finish = 'stop', usage = null;
     const toolCalls = [];
-    for await (const ev of streamDeltas(upstream)) {
+    for await (const ev of streamDeltas(upstream.res)) {
       if (ev.usage) usage = ev.usage;
       const d = ev.delta;
       if (d) {
@@ -199,7 +306,7 @@ async function handleChat(request, env) {
       chunk({ role: 'assistant', content: '' });
       let finish = 'stop', usage = null;
       try {
-        for await (const ev of streamDeltas(upstream)) {
+        for await (const ev of streamDeltas(upstream.res)) {
           if (ev.usage) usage = ev.usage;
           const d = ev.delta;
           if (d) {

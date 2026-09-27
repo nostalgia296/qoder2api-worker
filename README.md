@@ -98,11 +98,13 @@ npx wrangler secret put QODER_CREDS_JSON      # 粘贴 creds.json 全文
 
 | 路由 | 说明 |
 |---|---|
-| `POST /v1/chat/completions` | OpenAI 兼容，`stream: true/false`；错误走 OpenAI error 格式，Credits 用尽返回 402 |
+| `POST /v1/chat/completions` | OpenAI 兼容（含工具调用），`stream: true/false`；错误走 OpenAI error 格式，Credits 用尽返回 402 |
 | `GET /v1/models` | 14 个模型 key |
 | `GET /health` | 存活检查 |
 | `POST /admin/login` | 发起设备码登录，返回 `login_url` + `nonce`（需 QODER_KV） |
 | `POST /admin/login/wait` | 长轮询 `{nonce, timeout?}` 到授权完成，凭证自动写入 KV |
+| `POST /admin/checkin` | 领取全部可领活动（每日 100 credits），幂等 (需 API_KEY) |
+| `GET /admin/campaigns` | 活动/签到状态列表 (需 API_KEY) |
 | `POST /admin/creds` | 写入/更新 KV 凭证 |
 | `DELETE /admin/creds` | 清除 KV 凭证与 jobToken（切换账号用） |
 | `POST /admin/refresh` | 手动刷新 deviceToken（KV 存在时落盘） |
@@ -123,6 +125,79 @@ curl https://<worker>/v1/chat/completions \
 `dmodel`(DeepSeek-V4-Pro) / `kmodel`(Kimi) / `mmodel`(MiniMax-M3) / `cmodel`(Cantus) /
 `auto` / `lite` 等，详见 `GET /v1/models`。
 
+**工具调用**：网关原生支持 OpenAI function calling，代理逐字段透传（实测验证）：
+
+- `tools`：`[{type:'function', function:{name, description, parameters, strict?}}]`
+- `tool_choice` / `parallel_tool_calls` / `response_format`：进上游 `parameters` 对象
+  （官方 wire 格式；`auto` 实测生效，`required` 上游不强制）
+- `messages` 多轮原生透传：`system` / `user` / `assistant`（含 `tool_calls`）/
+  `tool`（含 `tool_call_id`）四个角色，`developer` 自动映射为 `system`
+- 流式：`delta.tool_calls` 分片原样转发，结束块 `finish_reason: 'tool_calls'`；
+  `stream_options: {"include_usage": true}` 时追加独立 usage 块
+- 非流式：`message.tool_calls`（按 `index` 合并分片后的完整调用）
+
+**usage 透传**：上游在 finish 事件之后单独下发一个 usage 事件，代理捕获后回填——
+非流式响应的 `usage` 为上游真实值；流式时真实 usage 挂在 finish 块上（无论客户端是否
+声明 `include_usage`），声明了则额外追加一个 `choices: []` 的独立 usage 块（OpenAI 规范）。
+字段为 OpenAI 标准 + Qoder 扩展：
+
+```json
+{"prompt_tokens":65, "completion_tokens":210, "total_tokens":275,
+ "prompt_tokens_details":{"cached_tokens":0},
+ "completion_tokens_details":{"reasoning_tokens":183},
+ "credits":0.01375418, "original_credits":0.01375418, "billable":false}
+```
+
+`credits`/`original_credits` 是本次请求消耗的账户额度，`billable` 表示是否计费。
+
+**每日签到/活动领 Credits**（对应逆向文档 CHAT_FLOW.md 第十节，`campaignMainService`）：
+
+```bash
+curl -X POST https://<worker>/admin/checkin -H "Authorization: Bearer <API_KEY>"
+# → {"ok":true,"granted":100,"claimed":1,"results":[{"campaignKey":"act-…","status":"GRANTED",
+#     "benefit":{"kind":"CREDITS","amount":100}}],"campaigns":[…全部活动…]}
+#   重复领取: status 仍 GRANTED 但 replayed=true / granted=0
+#   被风控拦截: failureCode=SAME_PERSON_ALREADY_CLAIMED (按人/设备指纹每日一次)
+```
+
+- `POST /admin/checkin` 领取所有 `CLAIM_BENEFIT` 且 `CLAIMABLE` 的活动；
+  `GET /admin/campaigns` 只查状态不领取
+- **自动签到**：wrangler.toml 里取消 `[triggers] crons` 注释（默认北京时间 09:16）并绑定
+  QODER_KV，Worker 每天自动领取并把结果写入 KV；`vars AUTO_CHECKIN = "false"` 可只停签到
+- `/admin/status` 的 `last_checkin` 字段可查最近一次（手动或 cron）签到结果
+- deviceToken 过期时签到接口会自动走 refresh 流程（与对话链路共用）
+
+```bash
+curl https://<worker>/v1/chat/completions \
+  -H "Authorization: Bearer <API_KEY>" -H "Content-Type: application/json" \
+  -d '{"model":"qfmodel",
+       "messages":[{"role":"user","content":"北京天气怎么样？"}],
+       "tools":[{"type":"function","function":{"name":"get_weather",
+         "description":"查询城市实时天气",
+         "parameters":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}}}]}'
+# → choices[0].finish_reason = "tool_calls"
+#   choices[0].message.tool_calls[0].function = {"name":"get_weather","arguments":"{\"city\": \"北京\"}"}
+```
+
+把 `tool` 角色结果（`role:'tool'`, `tool_call_id`, `content`）追加进 messages 再请求
+即完成一轮工具回合。注意 qfmodel 属 flash 档，个别情况下会把 tool 结果回传后再调一次
+工具（模型随机性，重试即可）；Credits 模型（GLM/DeepSeek/Kimi 等）工具调用更稳定。
+
+**图片识别（视觉）**：OpenAI `image_url` 内容部件透传，支持 data URL（base64）与
+http(s) 图片地址，与 IDE 发送截图的方式一致（`is_vl` 模型，qfmodel/qmodel 已验证）：
+
+```bash
+curl https://<worker>/v1/chat/completions \
+  -H "Authorization: Bearer <API_KEY>" -H "Content-Type: application/json" \
+  -d '{"model":"qfmodel",
+       "messages":[{"role":"user","content":[
+         {"type":"text","text":"这张图片是什么颜色？"},
+         {"type":"image_url","image_url":{"url":"data:image/png;base64,..."}}]}]}'
+```
+
+- `detail`（`high`/`low`/`auto`）跟随透传；`input_audio:{data,format}` 部件同样支持
+- 请自行选择支持视觉的模型；图片建议压缩后发送（base64 直接进签名请求体，越大越慢）
+
 ## 客户端接入
 
 任何 OpenAI SDK 把 base_url 指到 Worker 即可：
@@ -142,23 +217,3 @@ npx wrangler dev                 # 本地 workerd 跑 Worker（凭证用 secret/
 node test/node-e2e.mjs           # Node 直跑 handler 打真实网关（15 项断言）
 node ../_parity-test.mjs         # 剥离 glue 与原 lib 签名产物一致性 + 网关直测
 ```
-
-## 升级与再生成
-
-IDE 升级导致签名 WASM 变化时：
-
-```bash
-node deobf.mjs && node _build-cf-wasm.js   # 重新剥离 → 重新生成 cloudflare/src/wasm/
-node _parity-test.mjs                      # 验证后再部署
-```
-
-## 注意事项
-
-- **CPU 限制**：免费计划单请求 10ms CPU。SSE 解析是纯字符串处理，一般够用；
-  高并发/长文本建议 $5 Workers Paid（无 CPU 焦虑）。
-- **refresh_token 一次性**：自动刷新由模块级单飞（single-flight）保护，
-  不会并发轮换导致作废；刷新结果只在绑定了 KV 时持久化，否则 30 天后需重新登录。
-- **凭证安全**：`QODER_CREDS_JSON`/`API_KEY` 用 `wrangler secret put`（加密存储），
-  不要写进 `wrangler.toml` 的 `[vars]`；`/admin/*` 在配置了 `API_KEY` 时强制鉴权。
-- **上游限制**：网关按账户计费/限流，429/402 原样透传；machine_id 建议固定
-  （默认用 creds.json 里的），频繁变化可能触发风控。
