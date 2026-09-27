@@ -1,18 +1,11 @@
 {
-  "name": "qoder2api-worker",
-  "version": "1.0.0",
+  "name": "qoder2api",
   "private": true,
   "type": "module",
+  "description": "Qoder CN → OpenAI Chat Completions 兼容 API (Cloudflare Workers/Pages)",
   "scripts": {
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
-    "test": "vitest run",
-    "typecheck": "tsc --noEmit"
-  },
-  "devDependencies": {
-    "@cloudflare/workers-types": "^5.20260826.1",
-    "typescript": "^5.6.0",
-    "vitest": "^2.1.0",
-    "wrangler": "^4.30.0"
+    "build:single": "node build-single.mjs"
   }
 }
