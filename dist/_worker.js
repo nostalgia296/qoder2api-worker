@@ -269,29 +269,79 @@ function mapEffort(reqBody) {
   return v;
 }
 
-function messagesToPrompt(messages) {
-  const sys = [], turns = [];
-  for (const m of messages || []) {
-    const content = typeof m.content === 'string' ? m.content
-      : Array.isArray(m.content) ? m.content.map(p => p.text || p.content || '').join('\n') : '';
-    if (m.role === 'system' || m.role === 'developer') sys.push(content);
-    else turns.push(`${m.role === 'assistant' ? 'Assistant' : 'User'}: ${content}`);
+function mapParts(parts) {
+  const out = [];
+  for (const p of parts || []) {
+    if (!p || typeof p !== 'object') continue;
+    if (p.type === 'text') out.push({ type: 'text', text: p.text || '' });
+    else if (p.type === 'image_url' && p.image_url?.url) {
+      out.push({ type: 'image_url', image_url: { url: p.image_url.url, ...(p.image_url.detail ? { detail: p.image_url.detail } : {}) } });
+    } else if (p.type === 'input_audio' && p.input_audio?.data) {
+      out.push({ type: 'input_audio', input_audio: { data: p.input_audio.data, format: p.input_audio.format } });
+    }
   }
-  const parts = [];
-  if (sys.length) parts.push(`[System]\n${sys.join('\n\n')}`);
-  parts.push(turns.join('\n\n'));
-  parts.push('Assistant:');
-  return parts.join('\n\n');
+  return out;
 }
 
-export async function prepareChat(env, { model, prompt, effort }) {
+function mapMessages(messages) {
+  const out = [];
+  for (const m of messages || []) {
+    const role = m.role === 'developer' ? 'system' : m.role;
+    if (role !== 'system' && role !== 'user' && role !== 'assistant' && role !== 'tool') continue;
+    const msg = { role };
+    const c = m.content ?? m.contents;
+    const content = typeof c === 'string' || c === null ? c
+      : Array.isArray(c) ? mapParts(c)
+      : undefined;
+    if (content !== undefined) msg.content = content;
+    if (m.name) msg.name = m.name;
+    if (role === 'assistant' && Array.isArray(m.tool_calls) && m.tool_calls.length) {
+      msg.tool_calls = m.tool_calls.map(tc => ({
+        ...(tc.index !== undefined ? { index: tc.index } : {}),
+        id: tc.id,
+        type: tc.type ?? 'function',
+        function: { name: tc.function?.name, arguments: tc.function?.arguments ?? '' },
+      }));
+    }
+    if (role === 'tool' && m.tool_call_id) msg.tool_call_id = m.tool_call_id;
+    if (role === 'assistant' && typeof m.reasoning_content === 'string' && m.reasoning_content) msg.reasoning_content = m.reasoning_content;
+    out.push(msg);
+  }
+  return out;
+}
+
+function mapTools(tools) {
+  if (!Array.isArray(tools) || !tools.length) return undefined;
+  const mapped = tools
+    .filter(t => t?.type === 'function' && t.function?.name)
+    .map(t => ({
+      type: 'function',
+      function: {
+        name: t.function.name,
+        ...(t.function.description ? { description: t.function.description } : {}),
+        ...(t.function.parameters ? { parameters: t.function.parameters } : {}),
+        ...(t.function.strict !== undefined ? { strict: t.function.strict } : {}),
+      },
+    }));
+  return mapped.length ? mapped : undefined;
+}
+
+function mapParameters(reqBody) {
+  const p = {};
+  if (reqBody.tool_choice !== undefined) p.tool_choice = reqBody.tool_choice;
+  if (typeof reqBody.parallel_tool_calls === 'boolean') p.parallel_tool_calls = reqBody.parallel_tool_calls;
+  if (reqBody.response_format !== undefined) p.response_format = reqBody.response_format;
+  return Object.keys(p).length ? p : undefined;
+}
+
+export async function prepareChat(env, { model, messages, tools, parameters, effort }) {
   const creds = await resolveCreds(env);
   const jobToken = await getJobToken(env, creds);
   const requestId = uuid(), sessionId = uuid();
   const bodyObj = {
     model, stream: true,
     request_id: requestId, request_set_id: uuid(), session_id: sessionId,
-    messages: [{ role: 'user', content: prompt }],
+    messages,
     model_config: {
       key: model, display_name: model, model: '', format: 'openai', is_vl: true, is_reasoning: true,
       api_key: jobToken, url: '', source: 'system', max_input_tokens: 180000,
@@ -300,6 +350,8 @@ export async function prepareChat(env, { model, prompt, effort }) {
     context: { request_id: requestId, session_id: sessionId, client_type: 'qoderapp' },
   };
   if (effort) bodyObj.reasoning_effort = effort;
+  if (tools) bodyObj.tools = tools;
+  if (parameters) bodyObj.parameters = parameters;
 
   const machineId = env.QODER_MACHINE_ID || creds.machine_id || uuid();
   const userInfoJson = await makeUserCredential(creds);
@@ -338,8 +390,13 @@ export async function* streamDeltas(response) {
           inner = JSON.parse(env2.body || '{}');
         } catch { continue; }
         if (inner.code) throw new HttpError(Number(inner.statusCodeValue) || 502, inner.message || 'gateway error');
-        const d = inner.choices?.[0]?.delta;
-        if (d && (d.content || d.reasoning_content)) yield d;
+        const ch = inner.choices?.[0];
+        const d = ch ? (ch.delta ?? ch.message ?? null) : null;
+        const hasDelta = d && (d.content || d.reasoning_content || (Array.isArray(d.tool_calls) && d.tool_calls.length));
+        const finish = ch?.finish_reason && ch.finish_reason !== 'null' ? ch.finish_reason : undefined;
+        if (hasDelta || finish || inner.usage) {
+          yield { delta: hasDelta ? d : null, finish, usage: inner.usage ?? null };
+        }
       }
     }
   }
@@ -476,13 +533,17 @@ async function handleChat(request, env) {
   if (!Array.isArray(messages) || messages.length === 0) return errResp(400, 'messages is required', 'invalid_request_error');
   let effort;
   try { effort = mapEffort(reqBody || {}); } catch (e) { return errResp(400, e.message, 'invalid_request_error'); }
-  const prompt = messagesToPrompt(messages);
+  const mapped = mapMessages(messages);
+  if (!mapped.length) return errResp(400, 'messages contains no valid roles (system|user|assistant|tool)', 'invalid_request_error');
+  const tools = mapTools(reqBody?.tools);
+  const parameters = mapParameters(reqBody || {});
+  const includeUsage = reqBody?.stream_options?.include_usage === true;
   const id = 'chatcmpl-' + crypto.randomUUID().replaceAll('-', '').slice(0, 24);
   const created = Math.floor(Date.now() / 1000);
 
   let upstream;
   try {
-    const prepared = await prepareChat(env, { model, prompt, effort });
+    const prepared = await prepareChat(env, { model, messages: mapped, tools, parameters, effort });
     upstream = await fetch(prepared.url, { method: 'POST', headers: prepared.headers, body: prepared.body });
   } catch (e) {
     if (e instanceof HttpError) return errResp(e.status, e.message, e.type);
@@ -495,17 +556,32 @@ async function handleChat(request, env) {
   }
 
   if (!stream) {
-    let text = '', thinking = '';
-    for await (const d of streamDeltas(upstream)) {
-      if (d.reasoning_content) thinking += d.reasoning_content;
-      if (d.content) text += d.content;
+    let text = '', thinking = '', finish = 'stop', usage = null;
+    const toolCalls = [];
+    for await (const ev of streamDeltas(upstream)) {
+      if (ev.usage) usage = ev.usage;
+      const d = ev.delta;
+      if (d) {
+        if (d.reasoning_content) thinking += d.reasoning_content;
+        if (typeof d.content === 'string') text += d.content;
+        for (const tc of d.tool_calls || []) {
+          const idx = tc.index ?? toolCalls.length;
+          toolCalls[idx] ??= { id: '', type: 'function', function: { name: '', arguments: '' } };
+          if (tc.id) toolCalls[idx].id = tc.id;
+          if (tc.type) toolCalls[idx].type = tc.type;
+          if (tc.function?.name) toolCalls[idx].function.name += tc.function.name;
+          if (tc.function?.arguments) toolCalls[idx].function.arguments += tc.function.arguments;
+        }
+      }
+      if (ev.finish) finish = ev.finish;
     }
-    const message = { role: 'assistant', content: text };
+    const message = { role: 'assistant', content: text || null };
     if (thinking) message.reasoning_content = thinking;
+    if (toolCalls.length) message.tool_calls = toolCalls.filter(Boolean);
     return json({
       id, object: 'chat.completion', created, model,
-      choices: [{ index: 0, message, finish_reason: 'stop' }],
-      usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+      choices: [{ index: 0, message, finish_reason: finish }],
+      usage: usage ?? { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
     });
   }
 
@@ -513,15 +589,23 @@ async function handleChat(request, env) {
   const body = new ReadableStream({
     async start(ctrl) {
       const send = obj => ctrl.enqueue(encoder.encode(`data: ${JSON.stringify(obj)}\n\n`));
-      const chunk = (delta, finish = null) =>
-        send({ id, object: 'chat.completion.chunk', created, model, choices: [{ index: 0, delta, finish_reason: finish }] });
+      const chunk = (delta, finish = null, u = null) =>
+        send({ id, object: 'chat.completion.chunk', created, model, choices: [{ index: 0, delta, finish_reason: finish }], usage: u });
       chunk({ role: 'assistant', content: '' });
+      let finish = 'stop', usage = null;
       try {
-        for await (const d of streamDeltas(upstream)) {
-          if (d.reasoning_content) chunk({ reasoning_content: d.reasoning_content });
-          if (d.content) chunk({ content: d.content });
+        for await (const ev of streamDeltas(upstream)) {
+          if (ev.usage) usage = ev.usage;
+          const d = ev.delta;
+          if (d) {
+            if (d.reasoning_content) chunk({ reasoning_content: d.reasoning_content });
+            if (typeof d.content === 'string' && d.content) chunk({ content: d.content });
+            if (Array.isArray(d.tool_calls) && d.tool_calls.length) chunk({ tool_calls: d.tool_calls });
+          }
+          if (ev.finish) finish = ev.finish;
         }
-        chunk({}, 'stop');
+        chunk({}, finish, usage ?? { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 });
+        if (includeUsage) send({ id, object: 'chat.completion.chunk', created, model, choices: [], usage: usage ?? { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 } });
       } catch (e) {
         send({ error: { message: e?.message || String(e), type: 'api_error', code: e.status || 500 } });
       }

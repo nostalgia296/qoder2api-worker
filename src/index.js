@@ -1,7 +1,7 @@
 import {
   HttpError, MODEL_CATALOG, DEFAULT_MODEL,
   resolveCreds, saveCreds, refreshDeviceToken,
-  prepareChat, streamDeltas, mapEffort, messagesToPrompt,
+  prepareChat, streamDeltas, mapEffort, mapMessages, mapTools, mapParameters,
   jobTokenCacheState,
 } from './qoder.js';
 import { startLogin, waitLogin } from './login.js';
@@ -138,13 +138,17 @@ async function handleChat(request, env) {
   if (!Array.isArray(messages) || messages.length === 0) return errResp(400, 'messages is required', 'invalid_request_error');
   let effort;
   try { effort = mapEffort(reqBody || {}); } catch (e) { return errResp(400, e.message, 'invalid_request_error'); }
-  const prompt = messagesToPrompt(messages);
+  const mapped = mapMessages(messages);
+  if (!mapped.length) return errResp(400, 'messages contains no valid roles (system|user|assistant|tool)', 'invalid_request_error');
+  const tools = mapTools(reqBody?.tools);
+  const parameters = mapParameters(reqBody || {});
+  const includeUsage = reqBody?.stream_options?.include_usage === true;
   const id = 'chatcmpl-' + crypto.randomUUID().replaceAll('-', '').slice(0, 24);
   const created = Math.floor(Date.now() / 1000);
 
   let upstream;
   try {
-    const prepared = await prepareChat(env, { model, prompt, effort });
+    const prepared = await prepareChat(env, { model, messages: mapped, tools, parameters, effort });
     upstream = await fetch(prepared.url, { method: 'POST', headers: prepared.headers, body: prepared.body });
   } catch (e) {
     if (e instanceof HttpError) return errResp(e.status, e.message, e.type);
@@ -157,17 +161,32 @@ async function handleChat(request, env) {
   }
 
   if (!stream) {
-    let text = '', thinking = '';
-    for await (const d of streamDeltas(upstream)) {
-      if (d.reasoning_content) thinking += d.reasoning_content;
-      if (d.content) text += d.content;
+    let text = '', thinking = '', finish = 'stop', usage = null;
+    const toolCalls = [];
+    for await (const ev of streamDeltas(upstream)) {
+      if (ev.usage) usage = ev.usage;
+      const d = ev.delta;
+      if (d) {
+        if (d.reasoning_content) thinking += d.reasoning_content;
+        if (typeof d.content === 'string') text += d.content;
+        for (const tc of d.tool_calls || []) {
+          const idx = tc.index ?? toolCalls.length;
+          toolCalls[idx] ??= { id: '', type: 'function', function: { name: '', arguments: '' } };
+          if (tc.id) toolCalls[idx].id = tc.id;
+          if (tc.type) toolCalls[idx].type = tc.type;
+          if (tc.function?.name) toolCalls[idx].function.name += tc.function.name;
+          if (tc.function?.arguments) toolCalls[idx].function.arguments += tc.function.arguments;
+        }
+      }
+      if (ev.finish) finish = ev.finish;
     }
-    const message = { role: 'assistant', content: text };
+    const message = { role: 'assistant', content: text || null };
     if (thinking) message.reasoning_content = thinking;
+    if (toolCalls.length) message.tool_calls = toolCalls.filter(Boolean);
     return json({
       id, object: 'chat.completion', created, model,
-      choices: [{ index: 0, message, finish_reason: 'stop' }],
-      usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+      choices: [{ index: 0, message, finish_reason: finish }],
+      usage: usage ?? { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
     });
   }
 
@@ -175,15 +194,23 @@ async function handleChat(request, env) {
   const body = new ReadableStream({
     async start(ctrl) {
       const send = obj => ctrl.enqueue(encoder.encode(`data: ${JSON.stringify(obj)}\n\n`));
-      const chunk = (delta, finish = null) =>
-        send({ id, object: 'chat.completion.chunk', created, model, choices: [{ index: 0, delta, finish_reason: finish }] });
+      const chunk = (delta, finish = null, u = null) =>
+        send({ id, object: 'chat.completion.chunk', created, model, choices: [{ index: 0, delta, finish_reason: finish }], usage: u });
       chunk({ role: 'assistant', content: '' });
+      let finish = 'stop', usage = null;
       try {
-        for await (const d of streamDeltas(upstream)) {
-          if (d.reasoning_content) chunk({ reasoning_content: d.reasoning_content });
-          if (d.content) chunk({ content: d.content });
+        for await (const ev of streamDeltas(upstream)) {
+          if (ev.usage) usage = ev.usage;
+          const d = ev.delta;
+          if (d) {
+            if (d.reasoning_content) chunk({ reasoning_content: d.reasoning_content });
+            if (typeof d.content === 'string' && d.content) chunk({ content: d.content });
+            if (Array.isArray(d.tool_calls) && d.tool_calls.length) chunk({ tool_calls: d.tool_calls });
+          }
+          if (ev.finish) finish = ev.finish;
         }
-        chunk({}, 'stop');
+        chunk({}, finish, usage ?? { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 });
+        if (includeUsage) send({ id, object: 'chat.completion.chunk', created, model, choices: [], usage: usage ?? { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 } });
       } catch (e) {
         send({ error: { message: e?.message || String(e), type: 'api_error', code: e.status || 500 } });
       }

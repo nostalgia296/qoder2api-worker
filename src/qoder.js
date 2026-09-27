@@ -185,29 +185,79 @@ export function mapEffort(reqBody) {
   return v;
 }
 
-export function messagesToPrompt(messages) {
-  const sys = [], turns = [];
-  for (const m of messages || []) {
-    const content = typeof m.content === 'string' ? m.content
-      : Array.isArray(m.content) ? m.content.map(p => p.text || p.content || '').join('\n') : '';
-    if (m.role === 'system' || m.role === 'developer') sys.push(content);
-    else turns.push(`${m.role === 'assistant' ? 'Assistant' : 'User'}: ${content}`);
+function mapParts(parts) {
+  const out = [];
+  for (const p of parts || []) {
+    if (!p || typeof p !== 'object') continue;
+    if (p.type === 'text') out.push({ type: 'text', text: p.text || '' });
+    else if (p.type === 'image_url' && p.image_url?.url) {
+      out.push({ type: 'image_url', image_url: { url: p.image_url.url, ...(p.image_url.detail ? { detail: p.image_url.detail } : {}) } });
+    } else if (p.type === 'input_audio' && p.input_audio?.data) {
+      out.push({ type: 'input_audio', input_audio: { data: p.input_audio.data, format: p.input_audio.format } });
+    }
   }
-  const parts = [];
-  if (sys.length) parts.push(`[System]\n${sys.join('\n\n')}`);
-  parts.push(turns.join('\n\n'));
-  parts.push('Assistant:');
-  return parts.join('\n\n');
+  return out;
 }
 
-export async function prepareChat(env, { model, prompt, effort }) {
+export function mapMessages(messages) {
+  const out = [];
+  for (const m of messages || []) {
+    const role = m.role === 'developer' ? 'system' : m.role;
+    if (role !== 'system' && role !== 'user' && role !== 'assistant' && role !== 'tool') continue;
+    const msg = { role };
+    const c = m.content ?? m.contents;
+    const content = typeof c === 'string' || c === null ? c
+      : Array.isArray(c) ? mapParts(c)
+      : undefined;
+    if (content !== undefined) msg.content = content;
+    if (m.name) msg.name = m.name;
+    if (role === 'assistant' && Array.isArray(m.tool_calls) && m.tool_calls.length) {
+      msg.tool_calls = m.tool_calls.map(tc => ({
+        ...(tc.index !== undefined ? { index: tc.index } : {}),
+        id: tc.id,
+        type: tc.type ?? 'function',
+        function: { name: tc.function?.name, arguments: tc.function?.arguments ?? '' },
+      }));
+    }
+    if (role === 'tool' && m.tool_call_id) msg.tool_call_id = m.tool_call_id;
+    if (role === 'assistant' && typeof m.reasoning_content === 'string' && m.reasoning_content) msg.reasoning_content = m.reasoning_content;
+    out.push(msg);
+  }
+  return out;
+}
+
+export function mapTools(tools) {
+  if (!Array.isArray(tools) || !tools.length) return undefined;
+  const mapped = tools
+    .filter(t => t?.type === 'function' && t.function?.name)
+    .map(t => ({
+      type: 'function',
+      function: {
+        name: t.function.name,
+        ...(t.function.description ? { description: t.function.description } : {}),
+        ...(t.function.parameters ? { parameters: t.function.parameters } : {}),
+        ...(t.function.strict !== undefined ? { strict: t.function.strict } : {}),
+      },
+    }));
+  return mapped.length ? mapped : undefined;
+}
+
+export function mapParameters(reqBody) {
+  const p = {};
+  if (reqBody.tool_choice !== undefined) p.tool_choice = reqBody.tool_choice;
+  if (typeof reqBody.parallel_tool_calls === 'boolean') p.parallel_tool_calls = reqBody.parallel_tool_calls;
+  if (reqBody.response_format !== undefined) p.response_format = reqBody.response_format;
+  return Object.keys(p).length ? p : undefined;
+}
+
+export async function prepareChat(env, { model, messages, tools, parameters, effort }) {
   const creds = await resolveCreds(env);
   const jobToken = await getJobToken(env, creds);
   const requestId = uuid(), sessionId = uuid();
   const bodyObj = {
     model, stream: true,
     request_id: requestId, request_set_id: uuid(), session_id: sessionId,
-    messages: [{ role: 'user', content: prompt }],
+    messages,
     model_config: {
       key: model, display_name: model, model: '', format: 'openai', is_vl: true, is_reasoning: true,
       api_key: jobToken, url: '', source: 'system', max_input_tokens: 180000,
@@ -216,6 +266,8 @@ export async function prepareChat(env, { model, prompt, effort }) {
     context: { request_id: requestId, session_id: sessionId, client_type: 'qoderapp' },
   };
   if (effort) bodyObj.reasoning_effort = effort;
+  if (tools) bodyObj.tools = tools;
+  if (parameters) bodyObj.parameters = parameters;
 
   const machineId = env.QODER_MACHINE_ID || creds.machine_id || uuid();
   const userInfoJson = await makeUserCredential(creds);
@@ -254,8 +306,13 @@ export async function* streamDeltas(response) {
           inner = JSON.parse(env2.body || '{}');
         } catch { continue; }
         if (inner.code) throw new HttpError(Number(inner.statusCodeValue) || 502, inner.message || 'gateway error');
-        const d = inner.choices?.[0]?.delta;
-        if (d && (d.content || d.reasoning_content)) yield d;
+        const ch = inner.choices?.[0];
+        const d = ch ? (ch.delta ?? ch.message ?? null) : null;
+        const hasDelta = d && (d.content || d.reasoning_content || (Array.isArray(d.tool_calls) && d.tool_calls.length));
+        const finish = ch?.finish_reason && ch.finish_reason !== 'null' ? ch.finish_reason : undefined;
+        if (hasDelta || finish || inner.usage) {
+          yield { delta: hasDelta ? d : null, finish, usage: inner.usage ?? null };
+        }
       }
     }
   }
