@@ -18,7 +18,8 @@ cloudflare/
 ├── test/node-e2e.mjs      # Node 直跑 Worker handler 的端到端测试（打真实网关）
 └── package.json
 ```
-
+现在需要本地运行: `node server.mjs`, 因为cf禁止WebAssembly.instantiate()
+-----------
 ## 部署
 
 ### 方式一：Workers（wrangler，推荐）
